@@ -152,7 +152,31 @@ Connect your Figma design system libraries so the AI uses YOUR components, not g
 
 - **Node.js** 18 or later
 - **Figma** desktop or web app
-- **Cursor** IDE with MCP support
+- **Cursor** IDE with MCP support (or any MCP-compatible client — see below)
+
+## Using with Claude Code
+
+Figsor works with any MCP client, not just Cursor. To use it with [Claude Code](https://docs.anthropic.com/en/docs/claude-code):
+
+```bash
+claude mcp add --transport stdio --scope project figsor -- npx -y figsor
+```
+
+Or add to `.mcp.json` in your project root:
+
+```json
+{
+  "mcpServers": {
+    "figsor": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "figsor"]
+    }
+  }
+}
+```
+
+Then follow the same steps — open Figma, run the Figsor plugin, and chat.
 
 ## Configuration
 
