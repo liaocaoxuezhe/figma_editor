@@ -146,7 +146,7 @@ Connect your Figma design system libraries so the AI uses YOUR components, not g
 - Save & switch between libraries
 - Generate designs with your DS
 
-**[Get Figsor Pro →](https://figsor.gumroad.com)** — $9 one-time purchase
+**[Get Figsor Pro →](https://asifkabirantu.gumroad.com/l/oxoopm)** — $9 one-time purchase
 
 ## Requirements
 
@@ -162,4 +162,4 @@ Connect your Figma design system libraries so the AI uses YOUR components, not g
 
 ## License
 
-MIT © [Asif Kabir](https://github.com/asifkabir)
+MIT © [Asif Kabir](https://github.com/AsifKabirAntu)
