@@ -15,7 +15,7 @@ Cursor → MCP (stdio) → Figsor Server → WebSocket → Figma Plugin → Desi
 Clone this repo and import the plugin into Figma:
 
 ```bash
-git clone https://github.com/asifkabir/figsor.git
+https://github.com/AsifKabirAntu/figsor.git
 ```
 
 In Figma: **Plugins → Development → Import plugin from manifest** → select `figsor/figma-plugin/manifest.json`
