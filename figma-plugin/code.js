@@ -1,4 +1,4 @@
-// Figsor - Figma Plugin Code (Sandbox)
+// figma_editor - Figma Plugin Code (Sandbox)
 // This code runs in Figma's plugin sandbox. It receives commands from the UI
 // (which connects to the MCP server via WebSocket) and executes Figma API calls.
 
@@ -88,6 +88,16 @@ async function getNode(nodeId) {
   const node = await figma.getNodeByIdAsync(nodeId);
   if (!node) throw new Error('Node not found: ' + nodeId);
   return node;
+}
+
+function base64ToBytes(base64) {
+  var binary = atob(base64);
+  var len = binary.length;
+  var bytes = new Uint8Array(len);
+  for (var i = 0; i < len; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
 }
 
 function serializeNode(node, depth, maxDepth) {
@@ -450,6 +460,34 @@ async function handleCreateFrame(params) {
   return { id: frame.id, name: frame.name, width: frame.width, height: frame.height };
 }
 
+async function handleCreatePage(params) {
+  var page = figma.createPage();
+  page.name = params.name || 'Page';
+  if (params.switchToPage !== false) {
+    await figma.setCurrentPageAsync(page);
+  }
+  return { id: page.id, name: page.name, type: page.type };
+}
+
+async function handleCreateSection(params) {
+  var section = figma.createSection();
+  section.name = params.name || 'Section';
+  section.x = params.x || 0;
+  section.y = params.y || 0;
+  section.resize(params.width || 400, params.height || 300);
+
+  var parent = await resolveParent(params.parentId);
+  parent.appendChild(section);
+
+  return {
+    id: section.id,
+    name: section.name,
+    type: section.type,
+    width: Math.round(section.width),
+    height: Math.round(section.height),
+  };
+}
+
 async function handleCreateRectangle(params) {
   const rect = figma.createRectangle();
   rect.name = params.name || 'Rectangle';
@@ -753,6 +791,43 @@ async function handleMoveToParent(params) {
   }
 
   return { id: node.id, newParentId: parent.id, newParentName: parent.name };
+}
+
+async function handleGroupNodes(params) {
+  var nodeIds = params.nodeIds || [];
+  if (!nodeIds.length) throw new Error('Need at least one node to group');
+
+  var nodes = [];
+  for (var i = 0; i < nodeIds.length; i++) {
+    nodes.push(await getNode(nodeIds[i]));
+  }
+
+  var parent = params.parentId ? await getNode(params.parentId) : (nodes[0].parent || figma.currentPage);
+  if (!('appendChild' in parent)) throw new Error('Target parent cannot have children');
+
+  var group = figma.group(nodes, parent, params.index);
+  if (params.name) group.name = params.name;
+
+  return {
+    id: group.id,
+    name: group.name,
+    type: group.type,
+    childCount: group.children.length,
+  };
+}
+
+async function handleUngroupNodes(params) {
+  var node = await getNode(params.nodeId);
+  if (!('children' in node)) throw new Error('Node cannot be ungrouped');
+
+  var children = figma.ungroup(node);
+  return {
+    ungrouped: true,
+    count: children.length,
+    nodes: children.map(function(child) {
+      return { id: child.id, name: child.name, type: child.type };
+    }),
+  };
 }
 
 async function handleReadNodeProperties(params) {
@@ -1171,15 +1246,17 @@ async function handleSetFill(params) {
   return { id: node.id, name: node.name, fillCount: node.fills.length };
 }
 
-// ─── Image Fill (Placeholder + future URL support) ──────────────────────────
+// ─── Image Fill ─────────────────────────────────────────────────────────────
 
 async function handleSetImageFill(params) {
   var node;
+  var createdNode = false;
 
   if (params.nodeId) {
     node = await getNode(params.nodeId);
   } else {
     node = figma.createRectangle();
+    createdNode = true;
     node.x = params.x || 0;
     node.y = params.y || 0;
     node.resize(params.width || 300, params.height || 200);
@@ -1190,15 +1267,23 @@ async function handleSetImageFill(params) {
 
   if (!('fills' in node)) throw new Error('Node cannot have fills');
 
-  // Real image mode: imageBytes is an array of numbers (Uint8Array values)
-  if (params.imageBytes) {
-    var bytes;
-    if (Array.isArray(params.imageBytes)) {
-      bytes = new Uint8Array(params.imageBytes);
-    } else {
-      bytes = params.imageBytes;
-    }
+  // Real image mode
+  if (params.imageBase64 || params.imageBytes) {
+    var bytes = params.imageBase64
+      ? base64ToBytes(params.imageBase64)
+      : (Array.isArray(params.imageBytes) ? new Uint8Array(params.imageBytes) : params.imageBytes);
     var image = figma.createImage(bytes);
+    if (createdNode && (params.width === undefined || params.height === undefined)) {
+      try {
+        var size = await image.getSizeAsync();
+        node.resize(params.width || size.width, params.height || size.height);
+      } catch (e) {
+        // Keep the default rectangle size if Figma cannot read dimensions.
+        if (String(e && e.message || e).toLowerCase().includes('too large')) {
+          throw new Error('Image exceeds Figma limits after upload. Keep image dimensions within 4096x4096 px.');
+        }
+      }
+    }
     node.fills = [{
       type: 'IMAGE',
       imageHash: image.hash,
@@ -1531,24 +1616,36 @@ async function handleListAvailableFonts(params) {
 
 // ─── SVG Export ─────────────────────────────────────────────────────────────
 
-function uint8ToUtf8(bytes) {
-  if (typeof TextDecoder !== 'undefined') {
-    return new TextDecoder('utf-8').decode(bytes);
+function bytesToBase64(bytes) {
+  var chunkSize = 0x8000;
+  var binary = '';
+  for (var i = 0; i < bytes.length; i += chunkSize) {
+    var chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode.apply(null, chunk);
   }
-  // Manual UTF-8 decode fallback
-  var str = '';
-  for (var i = 0; i < bytes.length; ) {
-    var b = bytes[i];
-    if (b < 0x80) { str += String.fromCharCode(b); i++; }
-    else if (b < 0xE0) { str += String.fromCharCode(((b & 0x1F) << 6) | (bytes[i+1] & 0x3F)); i += 2; }
-    else if (b < 0xF0) { str += String.fromCharCode(((b & 0x0F) << 12) | ((bytes[i+1] & 0x3F) << 6) | (bytes[i+2] & 0x3F)); i += 3; }
-    else { i += 4; str += '\uFFFD'; }
-  }
-  return str;
+  return btoa(binary);
 }
 
-async function handleExportAsSvg(params) {
+async function handleExportAsImage(params) {
   var node = await getNode(params.nodeId);
+  var format = params.format || 'SVG';
+  var exportSettings = {
+    format: format === 'SVG' ? 'SVG_STRING' : format,
+  };
+
+  if (params.contentsOnly !== undefined) exportSettings.contentsOnly = params.contentsOnly;
+  if (params.useAbsoluteBounds !== undefined) exportSettings.useAbsoluteBounds = params.useAbsoluteBounds;
+  if ((format === 'PNG' || format === 'JPG') && params.constraintType && params.constraintValue !== undefined) {
+    exportSettings.constraint = {
+      type: params.constraintType,
+      value: params.constraintValue,
+    };
+  }
+  if (format === 'SVG') {
+    if (params.svgOutlineText !== undefined) exportSettings.svgOutlineText = params.svgOutlineText;
+    if (params.svgIdAttribute !== undefined) exportSettings.svgIdAttribute = params.svgIdAttribute;
+    if (params.svgSimplifyStroke !== undefined) exportSettings.svgSimplifyStroke = params.svgSimplifyStroke;
+  }
 
   if (params.exportChildren) {
     if (!('children' in node) || !node.children || node.children.length === 0) {
@@ -1561,13 +1658,14 @@ async function handleExportAsSvg(params) {
     for (var i = 0; i < limit; i++) {
       var child = node.children[i];
       try {
-        var svgBytes = await child.exportAsync({ format: 'SVG' });
-        var svgString = uint8ToUtf8(svgBytes);
+        var asset = await child.exportAsync(exportSettings);
         results.push({
           id: child.id,
           name: child.name,
           type: child.type,
-          svg: svgString,
+          format: format,
+          mimeType: format === 'SVG' ? 'image/svg+xml' : (format === 'PDF' ? 'application/pdf' : 'image/' + format.toLowerCase()),
+          data: typeof asset === 'string' ? asset : bytesToBase64(asset),
         });
       } catch (e) {
         results.push({
@@ -1587,14 +1685,14 @@ async function handleExportAsSvg(params) {
     };
   }
 
-  // Single node export
-  var svgBytes = await node.exportAsync({ format: 'SVG' });
-  var svgString = uint8ToUtf8(svgBytes);
+  var asset = await node.exportAsync(exportSettings);
 
   return {
     id: node.id,
     name: node.name,
-    svg: svgString,
+    format: format,
+    mimeType: format === 'SVG' ? 'image/svg+xml' : (format === 'PDF' ? 'application/pdf' : 'image/' + format.toLowerCase()),
+    data: typeof asset === 'string' ? asset : bytesToBase64(asset),
   };
 }
 
@@ -1655,6 +1753,8 @@ async function handleSetSelection(params) {
 const commandHandlers = {
   // Create
   create_frame: handleCreateFrame,
+  createPage: handleCreatePage,
+  create_section: handleCreateSection,
   create_rectangle: handleCreateRectangle,
   create_ellipse: handleCreateEllipse,
   create_text: handleCreateText,
@@ -1668,6 +1768,8 @@ const commandHandlers = {
   // Structure
   delete_node: handleDeleteNode,
   move_to_parent: handleMoveToParent,
+  group_nodes: handleGroupNodes,
+  ungroup_nodes: handleUngroupNodes,
   // Read
   get_selection: handleGetSelection,
   get_page_structure: handleGetPageStructure,
@@ -1702,22 +1804,18 @@ const commandHandlers = {
   get_variables: handleGetVariables,
   // Font discovery
   list_available_fonts: handleListAvailableFonts,
-  // SVG export
-  export_as_svg: handleExportAsSvg,
-  // Agent cursors (peer design)
-  spawn_agent: handleSpawnAgent,
-  dismiss_agent: handleDismissAgent,
-  dismiss_all_agents: handleDismissAllAgents,
+  // Export
+  export_as_image: handleExportAsImage,
 };
 
 figma.ui.onmessage = async (msg) => {
   // Handle settings persistence
   if (msg.type === 'save_settings') {
-    await figma.clientStorage.setAsync('figsor_settings', msg.settings);
+    await figma.clientStorage.setAsync('figma_editor_settings', msg.settings);
     return;
   }
   if (msg.type === 'load_settings') {
-    var settings = await figma.clientStorage.getAsync('figsor_settings');
+    var settings = await figma.clientStorage.getAsync('figma_editor_settings');
     figma.ui.postMessage({ type: 'settings_loaded', settings: settings || {} });
     return;
   }

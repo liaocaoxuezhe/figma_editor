@@ -1,189 +1,134 @@
-# Figsor
+# figma_editor
 
-**Chat in Cursor. Design in Figma.**
+**Chat in Cursor/Claude Code/Codex. Edit in Figma.**
 
-Figsor is an MCP server that bridges [Cursor AI](https://cursor.sh) to [Figma](https://www.figma.com), enabling chat-driven design creation and editing — directly on your Figma canvas.
+`figma_editor` is a personal fork and secondary-development project based on [`figsor`](https://github.com/AsifKabirAntu/figsor). It keeps the Figma canvas editing bridge, removes the Quiver / Peer Design / design-craft-guide paths, and adds stronger library, variable, structure, image, and export tooling.
+
+Repository:
+[github.com/liaocaoxuezhe/figma_editor](https://github.com/liaocaoxuezhe/figma_editor)
 
 ```
-Cursor → MCP (stdio) → Figsor Server → WebSocket → Figma Plugin → Design on Canvas
+Cursor/Claude Code/Codex → MCP (stdio) → figma_editor server → WebSocket → Figma plugin → Design on Canvas
 ```
 
 ## Setup
 
-### 1. Install the Figma Plugin (Sideload)
-
-Clone this repo and import the plugin into Figma:
+### 1. Clone the repository
 
 ```bash
-https://github.com/AsifKabirAntu/figsor.git
+git clone https://github.com/liaocaoxuezhe/figma_editor.git
+cd figma_editor
 ```
 
-In Figma: **Plugins → Development → Import plugin from manifest** → select `figsor/figma-plugin/manifest.json`
+### 2. Install the Figma plugin
 
-### 2. Add to Cursor
+In Figma: **Plugins → Development → Import plugin from manifest** → select `figma-plugin/manifest.json`
 
-Open your Cursor MCP settings and add:
+### 3. Add to your MCP client
+
+Cursor / Codex / Claude Code can all use the same MCP config:
 
 ```json
 {
   "mcpServers": {
-    "figsor": {
+    "figma_editor": {
       "command": "npx",
-      "args": ["-y", "figsor"]
+      "args": ["-y", "figma_editor"]
     }
   }
 }
 ```
 
-### 3. Start Designing
+If you prefer running from the local checkout during development:
+
+```json
+{
+  "mcpServers": {
+    "figma_editor": {
+      "command": "node",
+      "args": ["/absolute/path/to/figma_editor/mcp-server/dist/server.js"]
+    }
+  }
+}
+```
+
+### 4. Start editing
 
 1. Open a Figma file
-2. Run the Figsor plugin (Plugins → Development → Figsor)
-3. Chat in Cursor:
+2. Run the `figma_editor` plugin
+3. Chat in Cursor / Claude Code / Codex
 
-> "Create a mobile login screen with email and password fields"
+## Tool Highlights
 
-> "Design a dashboard with a sidebar, KPI cards, and charts"
+### Core editing
 
-> "Edit the selected frame — make the button rounded and change the color to blue"
+`create_frame`, `create_text`, `create_rectangle`, `create_ellipse`, `create_line`, `create_svg_node`, `modify_node`, `set_auto_layout`, `set_fill`, `set_stroke`, `set_effects`, `delete_node`, `move_to_parent`
 
-## Available Tools (45+)
+### Read and inspect
 
-### Create & Layout
+`get_selection`, `get_page_structure`, `read_node_properties`, `find_nodes`, `set_selection`, `get_local_styles`, `list_components`, `create_component_instance`, `detach_instance`
 
-| Tool | Description |
-|------|-------------|
-| `create_frame` | Create frames (screens, sections, cards) |
-| `create_text` | Add text with font, size, weight, color |
-| `create_rectangle` | Create rectangles and shapes |
-| `create_ellipse` | Create circles and ovals |
-| `create_line` | Create lines and dividers |
-| `create_svg_node` | Create icons and vector graphics from SVG |
-| `set_auto_layout` | Configure flexbox-style auto-layout |
-| `modify_node` | Edit any existing element |
-| `set_stroke` | Add borders and strokes |
-| `set_effects` | Add shadows and blur effects |
-| `delete_node` | Remove elements |
-| `move_to_parent` | Restructure the layer hierarchy |
+### Image, export, and animation
 
-### Read & Inspect
+`set_image_fill`, `export_as_image`, `show_animation_preview`
 
-| Tool | Description |
-|------|-------------|
-| `get_selection` | Read the current selection |
-| `get_page_structure` | Get the full page tree |
-| `read_node_properties` | Inspect any node's properties |
-| `find_nodes` | Search for elements by name or type |
-| `set_selection` | Select and zoom to elements |
-| `get_local_styles` | Read the file's design tokens |
-| `list_components` | Browse available components |
-| `create_component_instance` | Use existing components |
-| `detach_instance` | Convert instances to frames |
+`set_image_fill` supports:
+- Local file path
+- Base64 payload
+- Raw bytes
+- Plugin-uploaded image bridge via `usePluginImage: true`
 
-### Vector Drawing & Advanced Fills
+`export_as_image` supports `PNG`, `JPG`, `SVG`, and `PDF`.
 
-| Tool | Description |
-|------|-------------|
-| `create_vector` | Draw custom shapes with the pen tool |
-| `boolean_operation` | Union, subtract, intersect, or exclude shapes |
-| `flatten_nodes` | Flatten nodes into a single editable vector |
-| `set_fill` | Apply solid colors, linear/radial/angular/diamond gradients, multiple fills |
+### Variables
 
-### Image, Typography & Constraints
+`create_variable_collection`, `create_variable`, `bind_variable`, `get_variables`
 
-| Tool | Description |
-|------|-------------|
-| `set_image_fill` | Place image fills on nodes |
-| `style_text_range` | Apply mixed styling within text |
-| `set_constraints` | Set responsive constraints |
-| `list_available_fonts` | Discover available fonts |
+### Library workflow
 
-### Component & Variable Tools
+`scan_library`, `search_library_components`, `create_library_instance`, `get_library_info`
 
-| Tool | Description |
-|------|-------------|
-| `create_component` | Create a new main component |
-| `create_component_set` | Combine components into a variant set |
-| `create_variable_collection` | Create a design token collection with modes |
-| `create_variable` | Create a COLOR, FLOAT, STRING, or BOOLEAN token |
-| `bind_variable` | Bind a token to a node property |
-| `get_variables` | List all variable collections and tokens |
+These use the Figma access token stored in the plugin settings to read library metadata.
 
-### SVG Export & Animation
+### Page and structure
 
-| Tool | Description |
-|------|-------------|
-| `export_as_svg` | Export any node as SVG markup |
-| `show_animation_preview` | Live animated SVG previews + ZIP download |
+`createPage`, `create_section`, `group_nodes`, `ungroup_nodes`
 
-### AI-Powered SVG (Quiver)
+## Removed From figsor
 
-| Tool | Description |
-|------|-------------|
-| `quiver_generate_svg` | Generate SVG graphics from text prompts |
-| `quiver_vectorize_svg` | Convert raster images to clean SVG |
+- `quiver_generate_svg`
+- `quiver_vectorize_svg`
+- `get_design_craft_guide`
+- `spawn_design_agent`
+- `dismiss_design_agent`
+- `dismiss_all_agents`
 
-### Peer Design (Multi-Agent)
+## Open Source And Compliance
 
-| Tool | Description |
-|------|-------------|
-| `spawn_design_agent` | Spawn AI designer agents with visible cursors |
-| `dismiss_design_agent` | Remove an agent cursor |
-| `dismiss_all_agents` | Remove all agent cursors |
+This project is based on `figsor`, which is MIT-licensed.
 
-### Design Craft Guide
+To stay legally and ethically compliant, this repository keeps:
+- Clear attribution to the upstream project and original author
+- MIT license notice for the derivative work
+- A separate [NOTICE.md](NOTICE.md) describing upstream origin and modification status
 
-| Tool | Description |
-|------|-------------|
-| `get_design_craft_guide` | Professional design rules — typography, color, spacing, anti-AI-slop |
+Important:
+- This is currently a personal project and is not being run as a commercial product.
+- That statement does **not** change the code license.
+- Unless a file says otherwise, this repository remains under the MIT License, which permits commercial use, modification, distribution, and private use.
 
-## Pro: Design System Integration
+## Notes
 
-Connect your Figma design system libraries so the AI uses YOUR components, not generic ones.
-
-- Scan & import library components
-- Search across your design system
-- Save & switch between libraries
-- Generate designs with your DS
-
-**[Get Figsor Pro →](https://asifkabirantu.gumroad.com/l/oxoopm)** — $9 one-time purchase
-
-## Requirements
-
-- **Node.js** 18 or later
-- **Figma** desktop or web app
-- **Cursor** IDE with MCP support (or any MCP-compatible client — see below)
-
-## Using with Claude Code
-
-Figsor works with any MCP client, not just Cursor. To use it with [Claude Code](https://docs.anthropic.com/en/docs/claude-code):
-
-```bash
-claude mcp add --transport stdio --scope project figsor -- npx -y figsor
-```
-
-Or add to `.mcp.json` in your project root:
-
-```json
-{
-  "mcpServers": {
-    "figsor": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "figsor"]
-    }
-  }
-}
-```
-
-Then follow the same steps — open Figma, run the Figsor plugin, and chat.
+- The plugin requests the `teamlibrary` permission.
+- Large images are normalized before bridge transfer, and the MCP bridge sends base64 instead of huge integer arrays.
+- The export tool is generalized from SVG-only export to multi-format export.
 
 ## Configuration
 
 | Environment Variable | Default | Description |
-|---------------------|---------|-------------|
+|---|---:|---|
 | `FIGSOR_PORT` | `3055` | WebSocket server port |
 
 ## License
 
-MIT © [Asif Kabir](https://github.com/AsifKabirAntu)
+MIT. See [LICENSE](LICENSE).

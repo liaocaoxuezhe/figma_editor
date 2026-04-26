@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * Figsor — Figma ↔ Cursor MCP Server
+ * figma_editor — Figma ↔ Cursor MCP Server
  *
  * This server does two things:
  * 1. Runs an MCP server (over stdio) so Cursor can call design tools
  * 2. Runs a WebSocket server so the Figma plugin can connect and receive commands
  *
- * Flow: Cursor → MCP tool call → WebSocket → Figsor Figma Plugin → design created
+ * Flow: Cursor → MCP tool call → WebSocket → Figma plugin → design created
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -14,22 +14,35 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { WebSocketServer, WebSocket } from "ws";
 import { z } from "zod";
 import { randomUUID, createHmac, randomBytes } from "crypto";
-import {
-  SKILL_MD, TYPOGRAPHY_MD, COLOR_MD, MOTION_MD,
-  ICONS_MD, CRAFT_DETAILS_MD, ANTI_AI_SLOP_MD, EXAMPLE_WORKFLOW_MD,
-  DESIGN_GUIDES,
-} from "./design-knowledge/index.js";
+import { readFile } from "fs/promises";
 
 // ─── Logging (stderr only — stdout is reserved for MCP protocol) ────────────
 
 const log = (...args: unknown[]) =>
-  console.error(`[figsor ${new Date().toISOString()}]`, ...args);
+  console.error(`[figma_editor ${new Date().toISOString()}]`, ...args);
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 const WS_PORT = Number(process.env.FIGSOR_PORT) || 3055;
 const COMMAND_TIMEOUT_MS = 30_000;
 const FIGMA_API_BASE = "https://api.figma.com/v1";
+
+interface PluginContext {
+  token?: string | null;
+  imageBase64?: string | null;
+  imageName?: string | null;
+  imageMimeType?: string | null;
+}
+
+interface LibraryScanCache {
+  fileKey: string;
+  fileName: string;
+  editorType?: string;
+  lastScannedAt: string;
+  componentSets: Array<Record<string, unknown>>;
+  components: Array<Record<string, unknown>>;
+  styles: Array<Record<string, unknown>>;
+}
 
 // ─── Handshake Secret (obfuscated) ──────────────────────────────────────────
 // This key is split and reassembled at runtime to deter casual inspection.
@@ -45,7 +58,7 @@ interface PendingRequest {
   timeout: NodeJS.Timeout;
 }
 
-class FigsorBridge {
+class FigmaEditorBridge {
   private ws: WebSocket | null = null;
   private pendingRequests = new Map<string, PendingRequest>();
   private wss: WebSocketServer;
@@ -181,7 +194,7 @@ class FigsorBridge {
   async sendCommand(command: string, params: Record<string, unknown>): Promise<unknown> {
     if (!this.isConnected) {
       throw new Error(
-        "Figma plugin is not connected. Please open Figma and run the Figsor plugin first."
+        "Figma plugin is not connected. Please open Figma and run the figma_editor plugin first."
       );
     }
 
@@ -201,7 +214,7 @@ class FigsorBridge {
 
 // ─── Create instances ───────────────────────────────────────────────────────
 
-const bridge = new FigsorBridge(WS_PORT);
+const bridge = new FigmaEditorBridge(WS_PORT);
 
 // ─── Peer Design State ──────────────────────────────────────────────────────
 
@@ -209,34 +222,17 @@ let peerDesignSettings = { enabled: false, agentCount: 3 };
 let uploadedImageInfo: { name: string | null; size: number; mimeType: string | null; available: boolean } = {
   name: null, size: 0, mimeType: null, available: false,
 };
+const libraryScanCache = new Map<string, LibraryScanCache>();
 
 const server = new McpServer(
   {
-    name: "figsor",
+    name: "figma_editor",
     version: "1.0.0",
   },
   {
-    instructions: `You are a professional UI/UX designer working through Figsor — a Figma design tool.
+    instructions: `You are figma_editor, a Figma editing MCP server.
 
-BEFORE creating any design, you MUST:
-1. Call get_design_craft_guide("skill") to load the Research-First design methodology
-2. For specific craft areas, also call get_design_craft_guide with "typography", "color", "anti-ai-slop", etc.
-
-CRITICAL RULES (always follow):
-• NEVER use indigo/violet (#6366f1, #8b5cf6) as accent color unless the user explicitly asks for purple. This is the #1 sign of AI-generated design.
-• ALWAYS use frames + auto-layout for every container. Use padding/spacing, never hardcoded x/y positions.
-• ALWAYS set letter-spacing on ALL CAPS text (3-5px) and tighten large headings 32px+ (-0.3 to -0.5px).
-• NEVER use pure #000000 for text — use #0B0B0B or #111111.
-• Omit fillColor on layout-only container frames (they should be transparent).
-• Follow a 4px or 8px spacing grid.
-• Max 2 font families. Max 6-8 font sizes. Max 3-4 text color levels.
-• Color palette: 70-90% neutrals, 5-10% primary accent, semantic colors for status only.
-
-When the user asks you to design something, follow this process:
-1. Read the design craft guide
-2. Ask discovery questions if the request is vague
-3. Build with auto-layout, proper typography, and intentional color choices
-4. Validate against the quality checklist in the guide`,
+Favor existing components, variables, auto-layout, and clear structure. Use transparent container fills unless a background is intentional, avoid hard-coded positioning when layout tools are more appropriate, and preserve the user's current design system when one exists.`,
   }
 );
 
@@ -255,6 +251,102 @@ function err(error: string) {
   };
 }
 
+function parseFigmaFileKey(input: string) {
+  const trimmed = input.trim();
+  const match = trimmed.match(/figma\.com\/(?:design|file|board|slides)\/([^/?#]+)/i);
+  return match ? match[1] : trimmed;
+}
+
+function parseFigmaNodeId(input?: string) {
+  return input ? input.replace(/-/g, ":") : input;
+}
+
+function bytesToBase64(bytes: Uint8Array | Buffer) {
+  return Buffer.from(bytes).toString("base64");
+}
+
+async function getPluginContext(): Promise<PluginContext> {
+  return await bridge.sendCommand("get_plugin_context", {}) as PluginContext;
+}
+
+async function getFigmaToken() {
+  const ctx = await getPluginContext();
+  if (!ctx.token) {
+    throw new Error("Figma access token not configured in the plugin. Open the plugin Settings and paste a token with file/library read scopes.");
+  }
+  return ctx.token;
+}
+
+async function figmaApiGet<T>(token: string, path: string): Promise<T> {
+  const res = await fetch(`${FIGMA_API_BASE}${path}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  if (!res.ok) {
+    let payload: Record<string, unknown> | null = null;
+    try {
+      payload = await res.json() as Record<string, unknown>;
+    } catch {
+      payload = null;
+    }
+    const details = payload?.message || payload?.err || res.statusText;
+    throw new Error(`Figma API error [${res.status}]: ${details}`);
+  }
+
+  return await res.json() as T;
+}
+
+function normalizeLibraryComponent(item: Record<string, unknown>) {
+  return {
+    key: item.key,
+    fileKey: item.file_key,
+    nodeId: item.node_id,
+    name: item.name,
+    description: item.description || "",
+    thumbnailUrl: item.thumbnail_url,
+    updatedAt: item.updated_at,
+    createdAt: item.created_at,
+    containingFrame: item.containing_frame || null,
+  };
+}
+
+async function scanLibraryFile(fileOrUrl: string) {
+  const token = await getFigmaToken();
+  const fileKey = parseFigmaFileKey(fileOrUrl);
+
+  const [file, componentSetsResponse] = await Promise.all([
+    figmaApiGet<Record<string, unknown>>(token, `/files/${fileKey}`),
+    figmaApiGet<Record<string, unknown>>(token, `/files/${fileKey}/component_sets`),
+  ]);
+
+  const componentsMap = (file.components || {}) as Record<string, Record<string, unknown>>;
+  const stylesMap = (file.styles || {}) as Record<string, Record<string, unknown>>;
+  const componentSets = ((componentSetsResponse.meta as Record<string, unknown>)?.component_sets || []) as Array<Record<string, unknown>>;
+
+  const scan: LibraryScanCache = {
+    fileKey,
+    fileName: String(file.name || fileKey),
+    editorType: typeof file.editorType === "string" ? file.editorType : undefined,
+    lastScannedAt: new Date().toISOString(),
+    componentSets: componentSets.map(normalizeLibraryComponent),
+    components: Object.values(componentsMap).map(normalizeLibraryComponent),
+    styles: Object.values(stylesMap).map((style) => ({
+      key: style.key,
+      fileKey: style.file_key,
+      nodeId: style.node_id,
+      name: style.name,
+      description: style.description || "",
+      styleType: style.style_type || style.styleType || null,
+      thumbnailUrl: style.thumbnail_url || null,
+    })),
+  };
+
+  libraryScanCache.set(fileKey, scan);
+  return scan;
+}
+
 async function run(command: string, params: Record<string, unknown>) {
   try {
     const result = await bridge.sendCommand(command, params);
@@ -269,52 +361,9 @@ async function run(command: string, params: Record<string, unknown>) {
 // 1. Connection status
 server.tool(
   "get_connection_status",
-  `Check if the Figma plugin is connected and whether Peer Design mode is enabled. When peerDesign is enabled, you MUST spawn design agents (Nic, Deniz, Jaffa) before creating elements, and use agentId on every creation/modification tool call. Interleave work across agents for a collaborative feel.
-
-PEER DESIGN RULES (when peerDesign is enabled):
-1. BE CONSISTENT: Pick a cohesive style — colors, spacing, radii, font sizes — and apply it everywhere.
-2. USE AUTO-LAYOUT: Every container must use set_auto_layout with proper padding and spacing.
-3. TRULY SIMULTANEOUS: Call ALL THREE agents in the SAME tool call batch. Every response should contain 3+ tool calls at once — one per agent working on different elements at the same time. Never do one agent's work, wait, then the next. Batch them.
-4. COMPLETE EACH PIECE: Each element gets frame + auto-layout + stroke + content in one burst before moving on.`,
+  "Check whether the Figma plugin is connected.",
   {},
   async () => ok({ connected: bridge.isConnected, peerDesign: peerDesignSettings })
-);
-
-// ─── Peer Design: Agent Cursors ─────────────────────────────────────────────
-
-server.tool(
-  "spawn_design_agent",
-  `Spawn a visual AI designer agent on the Figma canvas. The agent appears as a Figma-native colored cursor with a name label — exactly like a real collaborator. Use this when Peer Design mode is enabled (check get_connection_status). Default agents: Nic (#3B82F6 blue), Deniz (#10B981 green), Jaffa (#F97316 orange).
-
-ORDER: First create the main root frame for the design. THEN spawn agents on top of it. This way agents appear on an already-set-up canvas, which looks natural.
-
-After spawning, pass agentId on every creation and modification call so each agent's cursor animates to their work.
-
-WORKFLOW: Agents are collaborative — they can work on the same section or split across different sections. E.g. all 3 build one stat card each simultaneously, or one builds frames while another fills content. Mix it up naturally. Interleave 2-5 ops per agent before switching.`,
-  {
-    agentId: z.string().describe("Unique ID for this agent, e.g. 'nic', 'deniz', 'jaffa'"),
-    name: z.string().describe("Display name on the cursor label, e.g. 'Nic', 'Deniz', 'Jaffa'"),
-    color: z.string().describe("Agent's color as hex — used for cursor arrow and label. e.g. '#3B82F6' (blue), '#10B981' (green), '#F97316' (orange)"),
-    x: z.number().optional().describe("Initial X position on canvas (default: 0)"),
-    y: z.number().optional().describe("Initial Y position on canvas (default: 0)"),
-  },
-  async (params) => run("spawn_agent", params)
-);
-
-server.tool(
-  "dismiss_design_agent",
-  "Remove a design agent's cursor from the canvas. Call this when the agent has finished designing.",
-  {
-    agentId: z.string().describe("ID of the agent to dismiss, e.g. 'nic'"),
-  },
-  async (params) => run("dismiss_agent", params)
-);
-
-server.tool(
-  "dismiss_all_agents",
-  "Remove ALL design agent cursors from the canvas. Call this when the entire design task is complete.",
-  {},
-  async () => run("dismiss_all_agents", {})
 );
 
 // 2. Create Frame
@@ -341,6 +390,52 @@ BEST PRACTICE: Always follow up with set_auto_layout on container frames. Use pa
     agentId: z.string().optional().describe("Design agent ID — agent cursor animates to this element"),
   },
   async (params) => run("create_frame", params)
+);
+
+server.tool(
+  "createPage",
+  "Create a new page in the current Figma file and optionally switch to it.",
+  {
+    name: z.string().optional().describe("Page name."),
+    switchToPage: z.boolean().optional().describe("Whether to switch the viewport to the new page. Defaults to true."),
+  },
+  async (params) => run("createPage", params)
+);
+
+server.tool(
+  "create_section",
+  "Create a section on the current page or inside a page-level parent.",
+  {
+    name: z.string().optional().describe("Section name."),
+    x: z.number().optional().describe("X position."),
+    y: z.number().optional().describe("Y position."),
+    width: z.number().optional().describe("Width in pixels."),
+    height: z.number().optional().describe("Height in pixels."),
+    parentId: z.string().optional().describe("Optional parent node id."),
+    agentId: z.string().optional().describe("Optional agent id."),
+  },
+  async (params) => run("create_section", params)
+);
+
+server.tool(
+  "group_nodes",
+  "Group nodes under a single Figma group.",
+  {
+    nodeIds: z.array(z.string()).describe("Node ids to group."),
+    parentId: z.string().optional().describe("Optional target parent for the group."),
+    index: z.number().optional().describe("Optional insertion index."),
+    name: z.string().optional().describe("Optional group name."),
+  },
+  async (params) => run("group_nodes", params)
+);
+
+server.tool(
+  "ungroup_nodes",
+  "Ungroup a Figma group and return the child node ids.",
+  {
+    nodeId: z.string().describe("Group node id."),
+  },
+  async (params) => run("ungroup_nodes", params)
 );
 
 // 3. Create Rectangle
@@ -645,22 +740,24 @@ server.tool(
   async (params) => run("read_node_properties", params)
 );
 
-// ─── SVG Export & Animation ─────────────────────────────────────────────────
+// ─── Export & Animation ─────────────────────────────────────────────────────
 
-// Export as SVG
 server.tool(
-  "export_as_svg",
-  `Export a Figma node as SVG markup string. Can export a single node or all direct children of a frame (batch mode). Use this to extract icon SVGs before applying animations, or to get raw SVG data for any visual element.`,
+  "export_as_image",
+  `Export a node in any Figma-supported export format. SVG returns markup text. PNG, JPG, and PDF return base64-encoded file content with mimeType metadata.`,
   {
-    nodeId: z.string().describe("ID of the node to export as SVG"),
-    exportChildren: z
-      .boolean()
-      .optional()
-      .describe(
-        "If true, exports all direct children of the node as individual SVGs instead of the node itself. Perfect for exporting a frame full of icons in one call."
-      ),
+    nodeId: z.string().describe("ID of the node to export."),
+    format: z.enum(["PNG", "JPG", "SVG", "PDF"]).optional().describe("Export format. Defaults to SVG."),
+    exportChildren: z.boolean().optional().describe("If true, export all direct children individually."),
+    constraintType: z.enum(["SCALE", "WIDTH", "HEIGHT"]).optional().describe("Optional image size constraint for PNG/JPG."),
+    constraintValue: z.number().optional().describe("Constraint value used with constraintType."),
+    svgOutlineText: z.boolean().optional().describe("SVG only. Defaults to true."),
+    svgIdAttribute: z.boolean().optional().describe("SVG only. Include layer names as ids."),
+    svgSimplifyStroke: z.boolean().optional().describe("SVG only. Defaults to true."),
+    contentsOnly: z.boolean().optional().describe("Whether to export only the node contents."),
+    useAbsoluteBounds: z.boolean().optional().describe("Whether to use uncropped node bounds."),
   },
-  async (params) => run("export_as_svg", params)
+  async (params) => run("export_as_image", params)
 );
 
 // Show Animation Preview
@@ -846,21 +943,62 @@ server.tool(
 
 server.tool(
   "set_image_fill",
-  `Apply an image fill to a node, or create a new image placeholder. Currently creates styled placeholder rectangles — real image support (Unsplash, URL) coming soon. Use placeholderText to describe what image should go here (e.g. 'Hero banner with team collaboration').`,
+  `Apply an image fill to a node, or create a new image-filled rectangle. Provide exactly one of imagePath, imageBase64, imageBytes, or usePluginImage to place a real PNG/JPEG/GIF image. If no image source is provided, creates a styled placeholder rectangle using placeholderText.`,
   {
     nodeId: z.string().optional().describe("ID of existing node to fill. If omitted, creates a new rectangle."),
     placeholderText: z.string().optional().describe("Description of the image content. Used as the node name for the placeholder."),
     name: z.string().optional().describe("Name for the node"),
+    imagePath: z.string().optional().describe("Local PNG/JPEG/GIF file path to upload into Figma. Absolute paths are recommended."),
+    imageBase64: z.string().optional().describe("Base64-encoded PNG/JPEG/GIF image data. Data URLs are accepted."),
+    imageBytes: z.array(z.number().int().min(0).max(255)).optional().describe("Raw PNG/JPEG/GIF bytes as an array of integers 0-255."),
+    usePluginImage: z.boolean().optional().describe("Use the image uploaded in the plugin's Image Upload section."),
     x: z.number().optional().describe("X position (only when creating new)"),
     y: z.number().optional().describe("Y position (only when creating new)"),
-    width: z.number().optional().describe("Width in pixels (only when creating new, default: 300)"),
-    height: z.number().optional().describe("Height in pixels (only when creating new, default: 200)"),
+    width: z.number().optional().describe("Width in pixels (only when creating new; defaults to the image width for real images, or 300 for placeholders)"),
+    height: z.number().optional().describe("Height in pixels (only when creating new; defaults to the image height for real images, or 200 for placeholders)"),
     cornerRadius: z.number().optional().describe("Corner radius (only when creating new)"),
     scaleMode: z.enum(["FILL", "FIT", "CROP", "TILE"]).optional().describe("How the image scales within the node (default: FILL)"),
     parentId: z.string().optional().describe("Parent frame ID (only when creating new)"),
     agentId: z.string().optional().describe("Design agent ID — agent cursor animates to this element"),
   },
-  async (params) => run("set_image_fill", params)
+  async (params) => {
+    try {
+      const imageSources = [
+        params.imagePath,
+        params.imageBase64,
+        params.imageBytes,
+        params.usePluginImage ? true : undefined,
+      ].filter(Boolean);
+
+      if (imageSources.length > 1) {
+        return err("Provide only one image source: imagePath, imageBase64, imageBytes, or usePluginImage.");
+      }
+
+      const prepared: Record<string, unknown> = { ...params };
+
+      if (params.imagePath) {
+        prepared.imageBase64 = bytesToBase64(await readFile(params.imagePath));
+        delete prepared.imagePath;
+      } else if (params.imageBase64) {
+        prepared.imageBase64 = params.imageBase64.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, "");
+      } else if (params.imageBytes) {
+        prepared.imageBase64 = bytesToBase64(Uint8Array.from(params.imageBytes));
+        delete prepared.imageBytes;
+      } else if (params.usePluginImage) {
+        const ctx = await getPluginContext();
+        if (!ctx.imageBase64) {
+          return err("No image uploaded in the plugin. Please upload an image in the Image Upload section first.");
+        }
+        prepared.imageBase64 = ctx.imageBase64;
+        prepared.name = params.name || ctx.imageName || "Uploaded Image";
+        delete prepared.usePluginImage;
+      }
+
+      return await run("set_image_fill", prepared);
+    } catch (e: unknown) {
+      return err(e instanceof Error ? e.message : String(e));
+    }
+  }
 );
 
 // ─── Text Range Styling ─────────────────────────────────────────────────────
@@ -1080,6 +1218,124 @@ server.tool(
   async () => run("get_local_styles", {})
 );
 
+server.tool(
+  "scan_library",
+  "Scan a Figma library file using the access token stored in the plugin Settings. Caches component sets, components, and styles for follow-up search calls.",
+  {
+    fileKey: z.string().optional().describe("Library file key. Provide either this or fileUrl."),
+    fileUrl: z.string().optional().describe("Figma file URL for the library."),
+  },
+  async (params) => {
+    try {
+      const target = params.fileUrl || params.fileKey;
+      if (!target) return err("Provide fileKey or fileUrl.");
+      const scan = await scanLibraryFile(target);
+      return ok({
+        fileKey: scan.fileKey,
+        fileName: scan.fileName,
+        editorType: scan.editorType,
+        lastScannedAt: scan.lastScannedAt,
+        componentSetCount: scan.componentSets.length,
+        componentCount: scan.components.length,
+        styleCount: scan.styles.length,
+      });
+    } catch (e: unknown) {
+      return err(e instanceof Error ? e.message : String(e));
+    }
+  }
+);
+
+server.tool(
+  "search_library_components",
+  "Search previously scanned library assets by name or description.",
+  {
+    query: z.string().describe("Search text."),
+    fileKey: z.string().optional().describe("Restrict search to one scanned library file."),
+    type: z.enum(["COMPONENT_SET", "COMPONENT", "STYLE", "ALL"]).optional().describe("Asset type filter. Defaults to ALL."),
+    limit: z.number().optional().describe("Maximum results to return."),
+  },
+  async (params) => {
+    const query = params.query.trim().toLowerCase();
+    if (!query) return err("Query is required.");
+
+    const scans = params.fileKey
+      ? [libraryScanCache.get(parseFigmaFileKey(params.fileKey))].filter(Boolean) as LibraryScanCache[]
+      : Array.from(libraryScanCache.values());
+    if (scans.length === 0) {
+      return err("No scanned libraries found. Call scan_library first.");
+    }
+
+    const buckets = [];
+    const requestedType = params.type || "ALL";
+    for (const scan of scans) {
+      if (requestedType === "ALL" || requestedType === "COMPONENT_SET") {
+        buckets.push(...scan.componentSets.map((item) => ({ ...item, assetType: "COMPONENT_SET", libraryFileKey: scan.fileKey, libraryFileName: scan.fileName })));
+      }
+      if (requestedType === "ALL" || requestedType === "COMPONENT") {
+        buckets.push(...scan.components.map((item) => ({ ...item, assetType: "COMPONENT", libraryFileKey: scan.fileKey, libraryFileName: scan.fileName })));
+      }
+      if (requestedType === "ALL" || requestedType === "STYLE") {
+        buckets.push(...scan.styles.map((item) => ({ ...item, assetType: "STYLE", libraryFileKey: scan.fileKey, libraryFileName: scan.fileName })));
+      }
+    }
+
+    const matches = buckets.filter((item) => {
+      const record = item as Record<string, unknown>;
+      const haystack = `${String(record.name || "")} ${String(record.description || "")}`.toLowerCase();
+      return haystack.includes(query);
+    });
+
+    return ok({
+      count: Math.min(matches.length, params.limit || 50),
+      total: matches.length,
+      results: matches.slice(0, params.limit || 50),
+    });
+  }
+);
+
+server.tool(
+  "create_library_instance",
+  "Import a published library component or component set by key and create an instance in the current file.",
+  {
+    key: z.string().describe("Published component or component set key."),
+    variantName: z.string().optional().describe("Optional variant name when key points to a component set."),
+    x: z.number().optional().describe("X position."),
+    y: z.number().optional().describe("Y position."),
+    width: z.number().optional().describe("Optional width override."),
+    height: z.number().optional().describe("Optional height override."),
+    name: z.string().optional().describe("Optional instance name."),
+    parentId: z.string().optional().describe("Optional parent node id."),
+    agentId: z.string().optional().describe("Optional agent id."),
+  },
+  async (params) => run("import_component_by_key", params)
+);
+
+server.tool(
+  "get_library_info",
+  "Get information about scanned libraries currently cached by the MCP server.",
+  {
+    fileKey: z.string().optional().describe("Optional file key to inspect a single scanned library."),
+  },
+  async (params) => {
+    const scans = params.fileKey
+      ? [libraryScanCache.get(parseFigmaFileKey(params.fileKey))].filter(Boolean) as LibraryScanCache[]
+      : Array.from(libraryScanCache.values());
+    if (scans.length === 0) return ok({ libraries: [] });
+
+    return ok({
+      libraries: scans.map((scan) => ({
+        fileKey: scan.fileKey,
+        fileName: scan.fileName,
+        editorType: scan.editorType,
+        lastScannedAt: scan.lastScannedAt,
+        componentSetCount: scan.componentSets.length,
+        componentCount: scan.components.length,
+        styleCount: scan.styles.length,
+      })),
+    });
+  }
+);
+
 // ─── Search & Edit Tools ────────────────────────────────────────────────────
 
 // 21. Find Nodes
@@ -1116,224 +1372,9 @@ server.tool(
   async (params) => run("set_selection", params)
 );
 
-// ─── Quiver AI: SVG Generation & Vectorization ─────────────────────────────
-// Server-side approach: MCP server requests API key + image from plugin, then
-// calls Quiver API directly from Node.js (bypasses Figma iframe network issues).
-
-const QUIVER_API = "https://api.quiver.ai/v1";
-
-async function getQuiverContext(): Promise<{ apiKey: string; imageBase64: string | null; imageName: string | null }> {
-  const result = await bridge.sendCommand("get_quiver_context", {}) as {
-    apiKey?: string;
-    imageBase64?: string | null;
-    imageName?: string | null;
-  };
-  if (!result || !result.apiKey) {
-    throw new Error("Quiver API key not configured. Open the Figsor plugin in Figma → Settings → enter your Quiver AI API Key. Get one at https://app.quiver.ai/settings/api-keys");
-  }
-  return {
-    apiKey: result.apiKey,
-    imageBase64: result.imageBase64 || null,
-    imageName: result.imageName || null,
-  };
-}
-
-async function callQuiverAPI(apiKey: string, endpoint: string, body: Record<string, unknown>): Promise<unknown> {
-  log(`Quiver API: POST ${endpoint}`);
-  const res = await fetch(QUIVER_API + endpoint, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    let errBody: Record<string, string> = {};
-    try { errBody = await res.json() as Record<string, string>; } catch (_e) { /* ignore */ }
-    const errCode = errBody.code || String(res.status);
-    const errMsg = errBody.message || res.statusText;
-    throw new Error(`Quiver API error [${errCode}]: ${errMsg}`);
-  }
-
-  return await res.json();
-}
-
-server.tool(
-  "quiver_generate_svg",
-  `Generate SVG graphics from a text prompt using Quiver AI. Returns high-quality AI-generated SVG markup. Use this for icons, logos, illustrations, and any vector graphic you can describe in words. You can also provide reference images to guide the style, including an image uploaded in the Figsor plugin's Image Upload section (set use_plugin_image_as_reference: true). The generated SVG can then be placed in Figma using create_svg_node.`,
-  {
-    prompt: z
-      .string()
-      .describe(
-        "Text description of the SVG to generate, e.g. 'A minimalist owl logo in woodcut style' or 'An icon of a rocket ship'"
-      ),
-    instructions: z
-      .string()
-      .optional()
-      .describe(
-        "Additional style or formatting guidance, e.g. 'Use a flat monochrome style with clean geometry'"
-      ),
-    references: z
-      .array(
-        z.union([
-          z.object({
-            url: z.string().describe("URL of a reference image (http/https)"),
-          }),
-          z.object({
-            base64: z.string().describe("Base64-encoded reference image"),
-          }),
-        ])
-      )
-      .optional()
-      .describe("Up to 4 reference images to guide the style (URL or base64)"),
-    use_plugin_image_as_reference: z
-      .boolean()
-      .optional()
-      .describe("Set to true to use the image uploaded in the Figsor plugin's Image Upload section as a style reference. The uploaded image will be added to the references array automatically. The user must upload an image in the plugin first."),
-    n: z
-      .number()
-      .optional()
-      .describe("Number of SVG variations to generate (1-16, default: 1)"),
-    temperature: z
-      .number()
-      .optional()
-      .describe("Sampling temperature 0-2 (default: 1). Lower = more deterministic"),
-    model: z
-      .string()
-      .optional()
-      .describe("Model ID (default: 'arrow-preview')"),
-  },
-  async (params) => {
-    try {
-      const ctx = await getQuiverContext();
-
-      const body: Record<string, unknown> = {
-        model: params.model || "arrow-preview",
-        prompt: params.prompt,
-        stream: false,
-      };
-      if (params.instructions) body.instructions = params.instructions;
-
-      // Build references array
-      const refs: Array<{ url?: string; base64?: string }> = params.references ? [...params.references] : [];
-      if (params.use_plugin_image_as_reference) {
-        if (!ctx.imageBase64) {
-          return err("No image uploaded in the Figsor plugin. Please upload an image in the plugin's Image Upload section first to use it as a reference.");
-        }
-        refs.push({ base64: ctx.imageBase64 });
-        log(`Using uploaded image as reference: ${ctx.imageName || "unknown"}`);
-      }
-      if (refs.length > 0) body.references = refs;
-
-      if (params.n) body.n = params.n;
-      if (params.temperature !== undefined) body.temperature = params.temperature;
-
-      const result = await callQuiverAPI(ctx.apiKey, "/svgs/generations", body) as {
-        data?: Array<{ svg: string }>;
-        usage?: unknown;
-      };
-      const svgs = (result.data || []).map((d, i) => ({ index: i, svg: d.svg }));
-
-      return ok({
-        count: svgs.length,
-        svgs,
-        usage: result.usage,
-        tip: "Use create_svg_node with the svg field to place this in Figma.",
-      });
-    } catch (e: unknown) {
-      return err(e instanceof Error ? e.message : String(e));
-    }
-  }
-);
-
-server.tool(
-  "quiver_vectorize_svg",
-  `Convert a raster image (PNG, JPG, etc.) into a clean SVG using Quiver AI. Provide either an image URL, base64-encoded image data, or set use_plugin_image to true to use an image uploaded in the Figsor plugin's Image Upload section. Great for converting logos, icons, illustrations, or any image into scalable vector format. The generated SVG can then be placed in Figma using create_svg_node. When the user uploads/pastes an image in the chat, instruct them to also upload it in the Figsor plugin's Image Upload section, then call this tool with use_plugin_image: true.`,
-  {
-    image_url: z
-      .string()
-      .optional()
-      .describe("URL of the image to vectorize (http/https). Provide either this, image_base64, or use_plugin_image."),
-    image_base64: z
-      .string()
-      .optional()
-      .describe("Base64-encoded image data. Provide either this, image_url, or use_plugin_image."),
-    use_plugin_image: z
-      .boolean()
-      .optional()
-      .describe("Set to true to use the image uploaded in the Figsor Figma plugin's Image Upload section. The user must upload an image there first. This is the recommended way when users share images in chat."),
-    auto_crop: z
-      .boolean()
-      .optional()
-      .describe("Auto-crop image to the dominant subject before vectorization (default: false)"),
-    n: z
-      .number()
-      .optional()
-      .describe("Number of SVG variations to generate (1-16, default: 1)"),
-    temperature: z
-      .number()
-      .optional()
-      .describe("Sampling temperature 0-2 (default: 1). Lower = more deterministic"),
-    model: z
-      .string()
-      .optional()
-      .describe("Model ID (default: 'arrow-preview')"),
-  },
-  async (params) => {
-    try {
-      const ctx = await getQuiverContext();
-
-      let imageBase64 = params.image_base64;
-      let imageUrl = params.image_url;
-
-      if (params.use_plugin_image) {
-        if (!ctx.imageBase64) {
-          return err("No image uploaded in the Figsor plugin. Please upload an image in the plugin's Image Upload section first.");
-        }
-        imageBase64 = ctx.imageBase64;
-        log(`Using uploaded image: ${ctx.imageName || "unknown"}`);
-      }
-
-      if (!imageUrl && !imageBase64) {
-        return err("Provide either image_url, image_base64, or set use_plugin_image to true (requires uploading an image in the Figsor plugin first).");
-      }
-
-      const image: Record<string, string> = {};
-      if (imageUrl) image.url = imageUrl;
-      else if (imageBase64) image.base64 = imageBase64;
-
-      const body: Record<string, unknown> = {
-        model: params.model || "arrow-preview",
-        image,
-        stream: false,
-      };
-      if (params.auto_crop !== undefined) body.auto_crop = params.auto_crop;
-      if (params.n) body.n = params.n;
-      if (params.temperature !== undefined) body.temperature = params.temperature;
-
-      const result = await callQuiverAPI(ctx.apiKey, "/svgs/vectorizations", body) as {
-        data?: Array<{ svg: string }>;
-        usage?: unknown;
-      };
-      const svgs = (result.data || []).map((d, i) => ({ index: i, svg: d.svg }));
-
-      return ok({
-        count: svgs.length,
-        svgs,
-        usage: result.usage,
-        tip: "Use create_svg_node with the svg field to place this in Figma.",
-      });
-    } catch (e: unknown) {
-      return err(e instanceof Error ? e.message : String(e));
-    }
-  }
-);
-
 server.tool(
   "get_uploaded_image_status",
-  `Check if an image has been uploaded in the Figsor plugin's Image Upload section. Returns the image name, size, and availability status. Use this to verify an image is ready before calling quiver_vectorize_svg with use_plugin_image: true.`,
+  "Check whether an image has been uploaded in the plugin Image Upload section.",
   {},
   async () => {
     return {
@@ -1345,57 +1386,9 @@ server.tool(
           size: uploadedImageInfo.size,
           mimeType: uploadedImageInfo.mimeType,
           tip: uploadedImageInfo.available
-            ? "Image is ready. Call quiver_vectorize_svg with use_plugin_image: true to vectorize it."
-            : "No image uploaded. Ask the user to upload an image in the Figsor plugin's Image Upload section.",
+            ? "Image is ready. Call set_image_fill with usePluginImage: true to use it."
+            : "No image uploaded. Ask the user to upload an image in the plugin Image Upload section.",
         }),
-      }],
-    };
-  }
-);
-
-// ─── Design Craft Knowledge (based on Refero Skill — MIT licensed) ────────
-// Full design methodology and reference guides bundled from:
-// https://github.com/referodesign/refero_skill
-
-const GUIDE_CONTENT: Record<string, string> = {
-  "skill": SKILL_MD,
-  "typography": TYPOGRAPHY_MD,
-  "color": COLOR_MD,
-  "motion": MOTION_MD,
-  "icons": ICONS_MD,
-  "craft-details": CRAFT_DETAILS_MD,
-  "anti-ai-slop": ANTI_AI_SLOP_MD,
-  "example-workflow": EXAMPLE_WORKFLOW_MD,
-};
-
-server.tool(
-  "get_design_craft_guide",
-  `Get the Figsor Design Craft Guide — a comprehensive Research-First design methodology with professional rules for typography, color, spacing, layout, motion, icons, and anti-AI-slop best practices. READ THIS BEFORE creating any design. Based on Refero Design Skill (MIT licensed).
-
-Available guides (pass as 'guide' parameter):
-• "skill" — MAIN GUIDE: Full Research-First methodology — discovery questions, research workflow, analysis framework, steal list, quality gates, Figma auto-layout rules
-• "typography" — Type scale, font pairing, weight, line-height, letter-spacing (ALL CAPS, small text, headings), text color system, responsive type
-• "color" — Palette structure (neutrals 70-90%, primary, semantic, effects), 60/30/10 rule, dark theme, contrast, token naming, anti-indigo rules
-• "motion" — Micro-interactions, timing (90-500ms by purpose), easing curves, reduced motion, animation tokens
-• "icons" — Sizing, optical corrections, style consistency (outline vs solid), icon+text pairing, accessibility, libraries (Lucide, Heroicons, etc.)
-• "craft-details" — Focus states, forms, images, touch/mobile, performance, accessibility, navigation, content copy rules
-• "anti-ai-slop" — What makes designs look AI-generated and how to avoid it — no default indigo, no blob backgrounds, intentional design choices
-• "example-workflow" — Complete walkthrough: SaaS churn reduction project using the full methodology
-
-Start with "skill" for the main methodology, then read specific guides as needed for the design task.`,
-  {
-    guide: z.enum(["skill", "typography", "color", "motion", "icons", "craft-details", "anti-ai-slop", "example-workflow"])
-      .optional()
-      .describe("Which guide to retrieve. Defaults to 'skill' (main methodology). See tool description for all options."),
-  },
-  async (params) => {
-    const key = params.guide || "skill";
-    const content = GUIDE_CONTENT[key];
-    const meta = DESIGN_GUIDES[key as keyof typeof DESIGN_GUIDES];
-    return {
-      content: [{
-        type: "text" as const,
-        text: `# ${meta.name}\n\n${content}\n\n---\n\nOther available guides: ${Object.entries(DESIGN_GUIDES).filter(([k]) => k !== key).map(([k, v]) => `"${k}" (${v.description})`).join(" | ")}`,
       }],
     };
   }
@@ -1404,7 +1397,7 @@ Start with "skill" for the main methodology, then read specific guides as needed
 // ─── Start ──────────────────────────────────────────────────────────────────
 
 async function main() {
-  log("Starting Figsor...");
+  log("Starting figma_editor...");
   log(`WebSocket server ready on ws://localhost:${WS_PORT}`);
   log("Waiting for Cursor to connect via stdio MCP...");
 

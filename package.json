@@ -1,8 +1,16 @@
 {
-  "name": "figsor",
+  "name": "figma_editor",
   "version": "1.0.0",
   "private": true,
-  "description": "Figma ↔ Cursor bridge: chat about designs in Cursor, create them in Figma",
+  "description": "Figma Editor MCP bridge: chat about designs in Cursor, create them in Figma",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/liaocaoxuezhe/figma_editor.git"
+  },
+  "homepage": "https://github.com/liaocaoxuezhe/figma_editor",
+  "bugs": {
+    "url": "https://github.com/liaocaoxuezhe/figma_editor/issues"
+  },
   "scripts": {
     "install:mcp": "cd mcp-server && npm install",
     "build": "cd mcp-server && npm run build",

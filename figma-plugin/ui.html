@@ -617,44 +617,10 @@
       <div style="font-size:10px; color:var(--figma-color-text-secondary); margin-top:2px;">
         Required for design system features. See the <a href="#" onclick="openGuide(); return false;" style="color:var(--figma-color-text-secondary); text-decoration:underline;">guide</a> for setup.
       </div>
-
-      <div style="margin-top:12px; padding-top:10px; border-top:1px solid var(--figma-color-border, #444);">
-        <label for="quiverKeyInput">Quiver AI API Key</label>
-        <input type="password" id="quiverKeyInput" placeholder="sk_live_xxxxxxxxxxxx..." onchange="saveSettings()" />
-        <div style="font-size:10px; color:var(--figma-color-text-secondary); margin-top:2px;">
-          For AI-powered SVG generation &amp; image vectorization. Get a key at <a href="https://app.quiver.ai/settings/api-keys" target="_blank" style="color:var(--figma-color-text-secondary); text-decoration:underline;">app.quiver.ai</a>.
-        </div>
-      </div>
     </div>
   </div>
 
-  <!-- Peer Design -->
-  <div class="section">
-    <div class="section-header" onclick="toggleSection('peerDesign')">
-      <span class="section-label">
-        <svg class="section-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-        Peer Design
-      </span>
-      <svg id="peerDesignChevron" class="chevron" width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M9 6l6 6-6 6"/></svg>
-    </div>
-    <div id="peerDesignBody" class="section-body">
-      <div class="pd-row">
-        <span class="pd-label">Enable Peer Design</span>
-        <div id="pdToggle" class="toggle-switch" onclick="togglePeerDesign()"></div>
-      </div>
-      <div class="pd-desc">
-        AI designers with named cursors appear on your canvas and design collaboratively — like real Figma collaborators.
-      </div>
-      <div id="pdAgents" style="display:none;">
-        <div class="saved-label">Active Designers</div>
-        <div id="activeAgentsList" class="pd-agents-list">
-          <span class="saved-empty">No active designers</span>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Image Upload (for Quiver vectorization) -->
+  <!-- Image Upload -->
   <div class="section">
     <div class="section-header" onclick="toggleSection('imageUpload')">
       <span class="section-label">
@@ -671,11 +637,11 @@
            ondrop="handleDrop(event)">
         <svg class="img-upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
         <span class="img-upload-text">Drop an image or click to upload</span>
-        <span class="img-upload-hint">PNG, JPG, WebP · Used for AI vectorization</span>
+        <span class="img-upload-hint">PNG, JPG, WebP, GIF · Used for image fills</span>
       </div>
       <input type="file" id="imgFileInput" accept="image/png,image/jpeg,image/webp,image/gif" style="display:none" onchange="handleFileSelect(event)" />
       <div style="font-size:10px; color:var(--figma-color-text-tertiary); margin-top:6px;">
-        Upload an image here, then ask Cursor to vectorize it. The image stays local in the plugin.
+        Upload an image here, then call <code>set_image_fill</code> with <code>usePluginImage: true</code>. The image stays local in the plugin.
       </div>
     </div>
   </div>
@@ -744,9 +710,9 @@
         </div>
         <div style="background:var(--figma-color-bg-secondary, rgba(255,255,255,0.05)); border:1px solid var(--figma-color-border, rgba(255,255,255,0.1)); border-radius:6px; padding:10px; margin:4px 0 8px 30px; font-family:'SF Mono','Monaco','Menlo',monospace; font-size:10px; line-height:1.6; color:var(--figma-color-text-secondary, #ccc); white-space:pre; overflow-x:auto;">{
   "mcpServers": {
-    "figsor": {
+    "figma_editor": {
       "command": "npx",
-      "args": ["-y", "figsor"]
+      "args": ["-y", "figma_editor"]
     }
   }
 }</div>
@@ -778,7 +744,7 @@
         <div class="guide-step">
           <div class="guide-step-num">2</div>
           <div class="guide-step-content">
-            Click <strong>Generate new token</strong>. Name it <code>Figsor</code> and set expiry to <strong>90 days</strong>.
+            Click <strong>Generate new token</strong>. Name it <code>figma_editor</code> and set expiry to <strong>90 days</strong>.
           </div>
         </div>
         <div class="guide-step">
@@ -825,13 +791,13 @@
           </div>
         </div>
         <div class="guide-note">
-          Figsor supports creating frames, shapes, text, SVG icons, auto-layout, effects, and importing design system components — all through chat.
+          figma_editor supports creating frames, shapes, text, SVG icons, auto-layout, effects, variables, and importing design system components — all through chat.
         </div>
       </div>
     </div>
 
     <div class="guide-divider"></div>
-    <div class="guide-footer">Figsor v1.0 · Figma + Cursor</div>
+    <div class="guide-footer">figma_editor v1.0 · Figma + Cursor</div>
   </div>
 
   <script>
@@ -839,8 +805,6 @@
     const WS_URL = 'ws://localhost:3055';
     let ws;
     let commandCount = 0;
-    let peerDesignEnabled = false;
-    var activeAgents = {}; // { agentId: { name, color } }
 
     // ─── UI Helpers ──────────────────────────────────────────────────────────
     const $ = (id) => document.getElementById(id);
@@ -876,54 +840,6 @@
     }
     function closeGuide() {
       $('guideOverlay').classList.remove('open');
-    }
-
-    // ─── Peer Design ──────────────────────────────────────────────────────────
-    function togglePeerDesign() {
-      peerDesignEnabled = !peerDesignEnabled;
-      var toggle = $('pdToggle');
-      var agentsSection = $('pdAgents');
-
-      if (peerDesignEnabled) {
-        toggle.classList.add('active');
-        agentsSection.style.display = 'block';
-      } else {
-        toggle.classList.remove('active');
-        agentsSection.style.display = 'none';
-        // Clean up ALL agent cursors (including orphans from previous sessions)
-        parent.postMessage({ pluginMessage: { type: 'cleanup_agent_cursors' } }, '*');
-        activeAgents = {};
-        renderActiveAgents();
-      }
-
-      // Send to MCP server
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'settings_update', peerDesign: peerDesignEnabled }));
-      }
-
-      saveSettings();
-      addLog('Peer Design: ' + (peerDesignEnabled ? 'ON' : 'OFF'));
-    }
-
-    function renderActiveAgents() {
-      var list = $('activeAgentsList');
-      var ids = Object.keys(activeAgents);
-
-      if (ids.length === 0) {
-        list.innerHTML = '<span class="saved-empty">No active designers</span>';
-        return;
-      }
-
-      list.innerHTML = '';
-      ids.forEach(function(id) {
-        var agent = activeAgents[id];
-        var item = document.createElement('div');
-        item.className = 'pd-agent-item';
-        item.innerHTML = '<span class="pd-agent-dot" style="background:' + agent.color + '"></span>' +
-          '<span class="pd-agent-name">' + agent.name + '</span>' +
-          '<span class="pd-agent-status">designing...</span>';
-        list.appendChild(item);
-      });
     }
 
     // ─── Animation Preview ─────────────────────────────────────────────────────
@@ -1205,34 +1121,66 @@
         addLog('Not an image file: ' + file.type);
         return;
       }
-      // Max 10MB
-      if (file.size > 10 * 1024 * 1024) {
-        addLog('Image too large (max 10MB): ' + (file.size / 1024 / 1024).toFixed(1) + 'MB');
-        return;
-      }
 
-      var reader = new FileReader();
-      reader.onload = function(e) {
-        var dataUrl = e.target.result;
-        // Extract base64 part (remove "data:image/png;base64," prefix)
-        var base64 = dataUrl.split(',')[1];
-        uploadedImageBase64 = base64;
+      normalizeImageFile(file).then(function(normalized) {
+        uploadedImageBase64 = normalized.base64;
         uploadedImageName = file.name;
-        uploadedImageSize = file.size;
-        renderImagePreview(dataUrl);
-        addLog('Image uploaded: ' + file.name + ' (' + formatBytes(file.size) + ')');
+        uploadedImageSize = normalized.size;
+        renderImagePreview(normalized.dataUrl);
+        addLog('Image uploaded: ' + file.name + ' (' + formatBytes(normalized.size) + ')');
 
-        // Notify MCP server that an image is available
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({
             type: 'image_uploaded',
             name: file.name,
-            size: file.size,
-            mimeType: file.type,
+            size: normalized.size,
+            mimeType: normalized.mimeType,
           }));
         }
-      };
-      reader.readAsDataURL(file);
+      }).catch(function(err) {
+        addLog('Image upload failed: ' + (err.message || err));
+      });
+    }
+
+    function normalizeImageFile(file) {
+      return new Promise(function(resolve, reject) {
+        var reader = new FileReader();
+        reader.onerror = function() { reject(new Error('Failed to read image file')); };
+        reader.onload = function(e) {
+          var originalDataUrl = e.target.result;
+          var img = new Image();
+          img.onerror = function() { reject(new Error('Failed to decode image')); };
+          img.onload = function() {
+            var maxSide = 4096;
+            var width = img.width;
+            var height = img.height;
+            var scale = Math.min(1, maxSide / Math.max(width, height));
+            var targetWidth = Math.max(1, Math.round(width * scale));
+            var targetHeight = Math.max(1, Math.round(height * scale));
+
+            var canvas = document.createElement('canvas');
+            canvas.width = targetWidth;
+            canvas.height = targetHeight;
+            var ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+
+            var outputMime = file.type === 'image/png' || file.type === 'image/gif' ? 'image/png' : 'image/jpeg';
+            var quality = outputMime === 'image/jpeg' ? 0.92 : undefined;
+            var normalizedDataUrl = canvas.toDataURL(outputMime, quality);
+            var base64 = normalizedDataUrl.split(',')[1];
+            var estimatedBytes = Math.ceil(base64.length * 3 / 4);
+
+            resolve({
+              dataUrl: normalizedDataUrl,
+              base64: base64,
+              size: estimatedBytes,
+              mimeType: outputMime,
+            });
+          };
+          img.src = originalDataUrl;
+        };
+        reader.readAsDataURL(file);
+      });
     }
 
     function renderImagePreview(dataUrl) {
@@ -1245,7 +1193,7 @@
           '<div class="img-preview-info">' +
             '<div class="img-preview-name">' + escapeHtml(uploadedImageName) + '</div>' +
             '<div class="img-preview-size">' + formatBytes(uploadedImageSize) + '</div>' +
-            '<div class="img-preview-status"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg> Ready for vectorization</div>' +
+            '<div class="img-preview-status"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg> Ready for image fills</div>' +
           '</div>' +
           '<button class="img-remove-btn" onclick="event.stopPropagation(); removeUploadedImage();" title="Remove image">' +
             '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>' +
@@ -1263,7 +1211,7 @@
       zone.innerHTML =
         '<svg class="img-upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>' +
         '<span class="img-upload-text">Drop an image or click to upload</span>' +
-        '<span class="img-upload-hint">PNG, JPG, WebP · Used for AI vectorization</span>';
+        '<span class="img-upload-hint">PNG, JPG, WebP, GIF · Used for image fills</span>';
       addLog('Image removed');
 
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1283,128 +1231,6 @@
       return div.innerHTML;
     }
 
-    // ─── Quiver AI ────────────────────────────────────────────────────────────
-    const QUIVER_API = 'https://api.quiver.ai/v1';
-    const quiverKeyInput = $('quiverKeyInput');
-
-    async function handleQuiverCommand(msgId, command, params) {
-      const apiKey = quiverKeyInput ? quiverKeyInput.value.trim() : '';
-      if (!apiKey) {
-        sendQuiverResponse(msgId, null, 'Quiver API key not configured. Open the Figsor plugin in Figma → Settings → enter your Quiver AI API Key. Get one at https://app.quiver.ai/settings/api-keys');
-        return;
-      }
-
-      try {
-        var endpoint, body;
-
-        if (command === 'quiver_generate_svg') {
-          endpoint = '/svgs/generations';
-          body = {
-            model: params.model || 'arrow-preview',
-            prompt: params.prompt,
-            stream: false,
-          };
-          if (params.instructions) body.instructions = params.instructions;
-
-          // Build references array, optionally including the plugin-uploaded image
-          var refs = params.references ? params.references.slice() : [];
-          if (params.use_plugin_image_as_reference) {
-            if (!uploadedImageBase64) {
-              sendQuiverResponse(msgId, null, 'No image uploaded in the Figsor plugin. Please upload an image in the plugin\'s Image Upload section first to use it as a reference.');
-              return;
-            }
-            refs.push({ base64: uploadedImageBase64 });
-            addLog('Using uploaded image as reference: ' + (uploadedImageName || 'unknown'));
-          }
-          if (refs.length > 0) body.references = refs;
-
-          if (params.n) body.n = params.n;
-          if (params.temperature !== undefined) body.temperature = params.temperature;
-          addLog('Quiver: generating SVG...');
-
-        } else if (command === 'quiver_vectorize_svg') {
-          endpoint = '/svgs/vectorizations';
-
-          // Support use_plugin_image — use the image uploaded in the plugin UI
-          if (params.use_plugin_image) {
-            if (!uploadedImageBase64) {
-              sendQuiverResponse(msgId, null, 'No image uploaded in the Figsor plugin. Please upload an image in the plugin\'s Image Upload section first.');
-              return;
-            }
-            params.image_base64 = uploadedImageBase64;
-            addLog('Using uploaded image: ' + (uploadedImageName || 'unknown'));
-          }
-
-          if (!params.image_url && !params.image_base64) {
-            sendQuiverResponse(msgId, null, 'Provide either image_url, image_base64, or set use_plugin_image to true (requires uploading an image in the Figsor plugin first).');
-            return;
-          }
-          var image = {};
-          if (params.image_url) image.url = params.image_url;
-          else if (params.image_base64) image.base64 = params.image_base64;
-
-          body = {
-            model: params.model || 'arrow-preview',
-            image: image,
-            stream: false,
-          };
-          if (params.auto_crop !== undefined) body.auto_crop = params.auto_crop;
-          if (params.n) body.n = params.n;
-          if (params.temperature !== undefined) body.temperature = params.temperature;
-          addLog('Quiver: vectorizing image...');
-
-        } else {
-          sendQuiverResponse(msgId, null, 'Unknown Quiver command: ' + command);
-          return;
-        }
-
-        const res = await fetch(QUIVER_API + endpoint, {
-          method: 'POST',
-          headers: {
-            'Authorization': 'Bearer ' + apiKey,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(body),
-        });
-
-        if (!res.ok) {
-          var errBody = {};
-          try { errBody = await res.json(); } catch (e) {}
-          var errCode = errBody.code || res.status;
-          var errMsg = errBody.message || res.statusText;
-          sendQuiverResponse(msgId, null, 'Quiver API error [' + errCode + ']: ' + errMsg);
-          addLog('Quiver error: ' + errMsg);
-          return;
-        }
-
-        const result = await res.json();
-        const svgs = (result.data || []).map(function(d, i) {
-          return { index: i, svg: d.svg };
-        });
-
-        sendQuiverResponse(msgId, {
-          count: svgs.length,
-          svgs: svgs,
-          usage: result.usage,
-          tip: 'Use create_svg_node with the svg field to place this in Figma.',
-        });
-        addLog('Quiver: got ' + svgs.length + ' SVG(s)');
-
-      } catch (e) {
-        sendQuiverResponse(msgId, null, e.message || String(e));
-        addLog('Quiver error: ' + (e.message || e));
-      }
-    }
-
-    function sendQuiverResponse(msgId, result, error) {
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      if (error) {
-        ws.send(JSON.stringify({ id: msgId, type: 'error', error: error }));
-      } else {
-        ws.send(JSON.stringify({ id: msgId, type: 'response', result: result }));
-      }
-    }
-
     // ─── Storage (via plugin sandbox) ────────────────────────────────────────
     function saveSettings() {
       parent.postMessage({
@@ -1412,8 +1238,6 @@
           type: 'save_settings',
           settings: {
             token: tokenInput ? tokenInput.value : '',
-            quiverKey: quiverKeyInput ? quiverKeyInput.value : '',
-            peerDesign: peerDesignEnabled,
           }
         }
       }, '*');
@@ -1536,10 +1360,6 @@
             authenticated = true;
             setStatus('connected', 'Connected');
             addLog('Authenticated ✓');
-            // Sync peer design setting
-            if (peerDesignEnabled) {
-              ws.send(JSON.stringify({ type: 'settings_update', peerDesign: true }));
-            }
             return;
           }
 
@@ -1563,24 +1383,18 @@
               return;
             }
 
-            // Intercept get_quiver_context — return API key + uploaded image to MCP server
-            if (data.command === 'get_quiver_context') {
-              const apiKey = quiverKeyInput ? quiverKeyInput.value.trim() : '';
+            // Return plugin-side bridge context to the MCP server
+            if (data.command === 'get_plugin_context') {
               ws.send(JSON.stringify({
                 id: data.id,
                 type: 'response',
                 result: {
-                  apiKey: apiKey || null,
+                  token: tokenInput ? tokenInput.value.trim() : null,
                   imageBase64: uploadedImageBase64 || null,
                   imageName: uploadedImageName || null,
+                  imageMimeType: uploadedImageBase64 ? 'image/png' : null,
                 }
               }));
-              return;
-            }
-
-            // Intercept Quiver AI commands — UI makes the API calls (fallback)
-            if (data.command === 'quiver_generate_svg' || data.command === 'quiver_vectorize_svg') {
-              handleQuiverCommand(data.id, data.command, data.params || {});
               return;
             }
 
@@ -1613,36 +1427,7 @@
       if (msg.type === 'settings_loaded') {
         if (msg.settings) {
           if (msg.settings.token && tokenInput) tokenInput.value = msg.settings.token;
-          if (msg.settings.quiverKey && quiverKeyInput) quiverKeyInput.value = msg.settings.quiverKey;
-          if (msg.settings.peerDesign) {
-            peerDesignEnabled = true;
-            $('pdToggle').classList.add('active');
-            $('pdAgents').style.display = 'block';
-          }
         }
-        return;
-      }
-
-      // Agent cursor events (peer design)
-      if (msg.type === 'agent_spawned') {
-        activeAgents[msg.agentId] = { name: msg.name, color: msg.color };
-        renderActiveAgents();
-        if (!$('pdAgents').style.display || $('pdAgents').style.display === 'none') {
-          $('pdAgents').style.display = 'block';
-        }
-        addLog('Agent joined: ' + msg.name);
-        return;
-      }
-      if (msg.type === 'agent_dismissed') {
-        delete activeAgents[msg.agentId];
-        renderActiveAgents();
-        addLog('Agent left: ' + msg.agentId);
-        return;
-      }
-      if (msg.type === 'agents_all_dismissed') {
-        activeAgents = {};
-        renderActiveAgents();
-        addLog('All agents dismissed');
         return;
       }
 

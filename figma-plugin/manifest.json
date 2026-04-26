@@ -1,19 +1,18 @@
 {
-  "name": "Figsor",
+  "name": "figma_editor",
   "id": "1604709694403650568",
   "api": "1.0.0",
   "main": "code.js",
   "ui": "ui.html",
   "editorType": ["figma"],
   "documentAccess": "dynamic-page",
+  "permissions": ["teamlibrary"],
   "networkAccess": {
     "allowedDomains": [
       "ws://localhost:3055",
       "https://*.figma.com",
-      "https://api.figma.com",
-      "https://*.quiver.ai",
-      "https://api.quiver.ai"
+      "https://api.figma.com"
     ],
-    "reasoning": "WebSocket to local MCP server (localhost:3055), Figma REST API, and Quiver AI API for SVG generation/vectorization"
+    "reasoning": "WebSocket to local MCP server (localhost:3055) and Figma REST API for library metadata reads"
   }
 }
