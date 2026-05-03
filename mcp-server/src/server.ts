@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * figma_editor — Figma ↔ Cursor MCP Server
+ * figma_editor — Figma ↔ MCP Client Server
  *
  * This server does two things:
- * 1. Runs an MCP server (over stdio) so Cursor can call design tools
+ * 1. Runs an MCP server (over stdio) so Codex/Claude Code/Cursor can call design tools
  * 2. Runs a WebSocket server so the Figma plugin can connect and receive commands
  *
- * Flow: Cursor → MCP tool call → WebSocket → Figma plugin → design created
+ * Flow: MCP client → MCP tool call → queued WebSocket bridge → Figma plugin → design created
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -58,22 +58,70 @@ interface PendingRequest {
   timeout: NodeJS.Timeout;
 }
 
+interface BridgeStatus {
+  mode: "hub" | "proxy";
+  connected: boolean;
+  pluginConnected: boolean;
+  agentProxyCount: number;
+  queuedCommands: number;
+}
+
 class FigmaEditorBridge {
-  private ws: WebSocket | null = null;
+  private pluginWs: WebSocket | null = null;
+  private agentWs: WebSocket | null = null;
+  private agentSockets = new Set<WebSocket>();
   private pendingRequests = new Map<string, PendingRequest>();
-  private wss: WebSocketServer;
-  private authenticated = false;
+  private wss: WebSocketServer | null = null;
+  private mode: "hub" | "proxy" = "hub";
+  private ready: Promise<void>;
+  private commandQueue: Promise<void> = Promise.resolve();
+  private queuedCommands = 0;
 
   constructor(port: number) {
-    this.wss = new WebSocketServer({ port });
-    log(`WebSocket server listening on port ${port}`);
+    this.ready = this.start(port);
+  }
 
-    this.wss.on("connection", (ws) => {
+  private async start(port: number) {
+    try {
+      const wss = new WebSocketServer({ port });
+      await new Promise<void>((resolve, reject) => {
+        const onListening = () => {
+          wss.off("error", onError);
+          resolve();
+        };
+        const onError = (error: Error & { code?: string }) => {
+          wss.off("listening", onListening);
+          reject(error);
+        };
+        wss.once("listening", onListening);
+        wss.once("error", onError);
+      });
+
+      this.wss = wss;
+      this.mode = "hub";
+      this.attachHubHandlers(wss);
+      log(`WebSocket hub listening on port ${port}`);
+      return;
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code !== "EADDRINUSE") {
+        throw error;
+      }
+
+      this.mode = "proxy";
+      log(`WebSocket port ${port} is already in use; joining existing figma_editor hub as an agent proxy`);
+      await this.connectAgentProxy(port);
+    }
+  }
+
+  private attachHubHandlers(wss: WebSocketServer) {
+    wss.on("connection", (ws) => {
       log("New WebSocket connection — starting handshake...");
 
       // Generate a random nonce for this connection
       const nonce = randomBytes(32).toString("hex");
       let handshakeComplete = false;
+      let role: "plugin" | "agent" | null = null;
 
       // Send nonce challenge
       ws.send(JSON.stringify({ type: "handshake_challenge", nonce }));
@@ -98,16 +146,24 @@ class FigmaEditorBridge {
                 .digest("hex");
               if (msg.hash === expected) {
                 handshakeComplete = true;
-                this.authenticated = true;
+                role = msg.role === "agent" ? "agent" : "plugin";
                 clearTimeout(handshakeTimeout);
 
-                // Close any previous connection
-                if (this.ws && this.ws !== ws && this.ws.readyState === WebSocket.OPEN) {
-                  this.ws.close();
+                if (role === "agent") {
+                  this.agentSockets.add(ws);
+                  ws.send(JSON.stringify({ type: "handshake_ok", role }));
+                  log(`Agent proxy authenticated ✓ (${this.agentSockets.size} connected)`);
+                  return;
                 }
-                this.ws = ws;
 
-                ws.send(JSON.stringify({ type: "handshake_ok" }));
+                // Close any previous Figma plugin connection. Agent proxy
+                // connections stay open and keep sharing the same hub.
+                if (this.pluginWs && this.pluginWs !== ws && this.pluginWs.readyState === WebSocket.OPEN) {
+                  this.pluginWs.close();
+                }
+                this.pluginWs = ws;
+
+                ws.send(JSON.stringify({ type: "handshake_ok", role }));
                 log("Figma plugin authenticated ✓");
               } else {
                 log("Handshake failed — invalid hash");
@@ -121,6 +177,35 @@ class FigmaEditorBridge {
           }
 
           // ── Authenticated messages ──
+
+          if (role === "agent") {
+            if (msg.type === "agent_status" && msg.id) {
+              ws.send(JSON.stringify({ type: "agent_response", id: msg.id, result: this.status }));
+              return;
+            }
+
+            if (msg.type !== "agent_command" || !msg.id || !msg.command) {
+              ws.send(JSON.stringify({ type: "agent_error", id: msg.id, error: "Invalid agent command" }));
+              return;
+            }
+
+            this.enqueuePluginCommand(msg.command, msg.params || {})
+              .then((result) => {
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({ type: "agent_response", id: msg.id, result }));
+                }
+              })
+              .catch((error: unknown) => {
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({
+                    type: "agent_error",
+                    id: msg.id,
+                    error: error instanceof Error ? error.message : String(error),
+                  }));
+                }
+              });
+            return;
+          }
 
           // Handle peer design settings from plugin UI
           if (msg.type === "settings_update") {
@@ -168,10 +253,15 @@ class FigmaEditorBridge {
 
       ws.on("close", () => {
         clearTimeout(handshakeTimeout);
-        if (this.ws === ws) {
+        if (role === "agent") {
+          this.agentSockets.delete(ws);
+          log(`Agent proxy disconnected (${this.agentSockets.size} connected)`);
+          return;
+        }
+
+        if (this.pluginWs === ws) {
           log("Figma plugin disconnected");
-          this.ws = null;
-          this.authenticated = false;
+          this.pluginWs = null;
           // Reject all pending requests
           for (const [, pending] of this.pendingRequests) {
             clearTimeout(pending.timeout);
@@ -187,12 +277,132 @@ class FigmaEditorBridge {
     });
   }
 
+  private async connectAgentProxy(port: number) {
+    const url = `ws://localhost:${port}`;
+    this.agentWs = await new Promise<WebSocket>((resolve, reject) => {
+      const ws = new WebSocket(url);
+      const timeout = setTimeout(() => {
+        ws.close();
+        reject(new Error(`Timed out connecting to figma_editor hub at ${url}`));
+      }, 5000);
+
+      ws.on("message", (data) => {
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.type === "handshake_challenge" && msg.nonce) {
+            const hash = createHmac("sha256", HANDSHAKE_KEY)
+              .update(msg.nonce)
+              .digest("hex");
+            ws.send(JSON.stringify({ type: "handshake_response", hash, role: "agent" }));
+            return;
+          }
+
+          if (msg.type === "handshake_ok") {
+            clearTimeout(timeout);
+            this.attachProxyMessageHandlers(ws);
+            log("Connected to existing figma_editor hub as an agent proxy ✓");
+            resolve(ws);
+            return;
+          }
+        } catch (error) {
+          clearTimeout(timeout);
+          reject(error);
+        }
+      });
+
+      ws.on("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+    });
+  }
+
+  private attachProxyMessageHandlers(ws: WebSocket) {
+    ws.on("message", (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        const pending = this.pendingRequests.get(msg.id);
+        if (!pending) return;
+
+        clearTimeout(pending.timeout);
+        this.pendingRequests.delete(msg.id);
+        if (msg.type === "agent_error") {
+          pending.reject(new Error(msg.error));
+        } else if (msg.type === "agent_response") {
+          pending.resolve(msg.result);
+        }
+      } catch (error) {
+        log("Error parsing proxy WebSocket message:", error);
+      }
+    });
+
+    ws.on("close", () => {
+      log("Disconnected from figma_editor hub");
+      this.agentWs = null;
+      for (const [, pending] of this.pendingRequests) {
+        clearTimeout(pending.timeout);
+        pending.reject(new Error("Disconnected from figma_editor hub"));
+      }
+      this.pendingRequests.clear();
+    });
+
+    ws.on("error", (error) => {
+      log("Agent proxy WebSocket error:", error.message);
+    });
+  }
+
   get isConnected(): boolean {
-    return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
+    if (this.mode === "proxy") {
+      return this.agentWs !== null && this.agentWs.readyState === WebSocket.OPEN;
+    }
+    return this.pluginWs !== null && this.pluginWs.readyState === WebSocket.OPEN;
+  }
+
+  get status(): BridgeStatus {
+    return {
+      mode: this.mode,
+      connected: this.isConnected,
+      pluginConnected: this.pluginWs !== null && this.pluginWs.readyState === WebSocket.OPEN,
+      agentProxyCount: this.agentSockets.size,
+      queuedCommands: this.queuedCommands,
+    };
+  }
+
+  async getStatus(): Promise<BridgeStatus> {
+    await this.ready;
+    if (this.mode === "proxy") {
+      return await this.sendStatusToHub() as BridgeStatus;
+    }
+    return this.status;
   }
 
   async sendCommand(command: string, params: Record<string, unknown>): Promise<unknown> {
-    if (!this.isConnected) {
+    await this.ready;
+    if (this.mode === "proxy") {
+      return this.sendCommandToHub(command, params);
+    }
+    return this.enqueuePluginCommand(command, params);
+  }
+
+  private enqueuePluginCommand(command: string, params: Record<string, unknown>): Promise<unknown> {
+    this.queuedCommands++;
+    const queuedPosition = this.queuedCommands;
+    if (queuedPosition > 1) {
+      log(`Queued command '${command}' behind ${queuedPosition - 1} command(s)`);
+    }
+
+    const task = async () => {
+      this.queuedCommands--;
+      return this.sendCommandToPlugin(command, params);
+    };
+
+    const result = this.commandQueue.then(task, task);
+    this.commandQueue = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private async sendCommandToPlugin(command: string, params: Record<string, unknown>): Promise<unknown> {
+    if (!this.pluginWs || this.pluginWs.readyState !== WebSocket.OPEN) {
       throw new Error(
         "Figma plugin is not connected. Please open Figma and run the figma_editor plugin first."
       );
@@ -207,7 +417,45 @@ class FigmaEditorBridge {
       }, COMMAND_TIMEOUT_MS);
 
       this.pendingRequests.set(id, { resolve, reject, timeout });
-      this.ws!.send(JSON.stringify({ id, command, params }));
+      this.pluginWs!.send(JSON.stringify({ id, command, params }));
+    });
+  }
+
+  private sendCommandToHub(command: string, params: Record<string, unknown>): Promise<unknown> {
+    if (!this.agentWs || this.agentWs.readyState !== WebSocket.OPEN) {
+      throw new Error(
+        "figma_editor hub is not connected. Start one MCP client first, then run the Figma plugin."
+      );
+    }
+
+    const id = randomUUID();
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingRequests.delete(id);
+        reject(new Error(`Command '${command}' timed out after ${COMMAND_TIMEOUT_MS}ms`));
+      }, COMMAND_TIMEOUT_MS);
+
+      this.pendingRequests.set(id, { resolve, reject, timeout });
+      this.agentWs!.send(JSON.stringify({ type: "agent_command", id, command, params }));
+    });
+  }
+
+  private sendStatusToHub(): Promise<unknown> {
+    if (!this.agentWs || this.agentWs.readyState !== WebSocket.OPEN) {
+      return Promise.resolve(this.status);
+    }
+
+    const id = randomUUID();
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingRequests.delete(id);
+        reject(new Error(`Status request timed out after ${COMMAND_TIMEOUT_MS}ms`));
+      }, COMMAND_TIMEOUT_MS);
+
+      this.pendingRequests.set(id, { resolve, reject, timeout });
+      this.agentWs!.send(JSON.stringify({ type: "agent_status", id }));
     });
   }
 }
@@ -363,7 +611,7 @@ server.tool(
   "get_connection_status",
   "Check whether the Figma plugin is connected.",
   {},
-  async () => ok({ connected: bridge.isConnected, peerDesign: peerDesignSettings })
+  async () => ok({ ...(await bridge.getStatus()), peerDesign: peerDesignSettings })
 );
 
 // 2. Create Frame
@@ -1398,13 +1646,13 @@ server.tool(
 
 async function main() {
   log("Starting figma_editor...");
-  log(`WebSocket server ready on ws://localhost:${WS_PORT}`);
-  log("Waiting for Cursor to connect via stdio MCP...");
+  log(`WebSocket bridge target ws://localhost:${WS_PORT}`);
+  log("Waiting for MCP client to connect via stdio...");
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  log("MCP server connected — ready to receive tool calls from Cursor");
+  log("MCP server connected — ready to receive tool calls");
 }
 
 main().catch((e) => {

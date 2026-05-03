@@ -11,6 +11,8 @@ Repository:
 Cursor/Claude Code/Codex → MCP (stdio) → figma_editor server → WebSocket → Figma plugin → Design on Canvas
 ```
 
+Multiple MCP clients can be open at the same time. The first local MCP process becomes the WebSocket hub on `FIGSOR_PORT`; later Codex / Claude Code / Cursor processes detect the occupied port, join that hub as agent proxies, and the hub sends all Figma plugin commands through a single serial queue.
+
 ## Setup
 
 ### 1. Clone the repository
@@ -127,7 +129,7 @@ Important:
 
 | Environment Variable | Default | Description |
 |---|---:|---|
-| `FIGSOR_PORT` | `3055` | WebSocket server port |
+| `FIGSOR_PORT` | `3055` | Local WebSocket hub port. Keep this the same across clients that should share one Figma plugin session. |
 
 ## License
 
